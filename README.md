@@ -3,10 +3,10 @@ My learnings about Jenkin automation with Accurev repository
 
 Accurev:
 
-Login to Accurev: accurev login <Username> <Password>
+Login to Accurev: accurev login '<Username>' '<Password>'
 Keep the files in Accurev: accurev keep -c "test comment" -l C:\Filelist.txt
 Promote to Dev from Workspace: accurev promote -c "test comment" -l C:\Filelist.txt
-Promote from stream to stream: accurev promote -c <Comment> -s <FromStream> -S <ToStream> -l "C:\Filelist.txt"
+Promote from stream to stream: accurev promote -c '<Comment>' -s '<FromStream>' -S '<ToStream>' -l "C:\Filelist.txt"
 Check the status in any stream for objects in a given list:accurev files -s <Stream> -l "C:\Filelist.txt"
 Find all the files which do not have status as member: accurev files -s <Stream> -l "C:\Filelist.txt" | C:\Windows\System32\find /v /i "member"
 List all the users in a given group: accurev show -g <Group name> members
