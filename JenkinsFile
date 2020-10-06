@@ -1,0 +1,162 @@
+//################################################################################################################
+//# This is Jenkins Deployment on demand pipeline for Datastage UNIX files and DS Jobs Deployment
+//################################################################################################################
+
+
+pipeline {
+  agent none
+    parameters {
+      string(name: 'CommitID', defaultValue: '', description: 'This is to take the commitID for checkout')
+      string(name: 'ProjectID', defaultValue: '', description: 'ProjectID associate with this change')
+      choice choices: ['IT', 'QA', 'PROD'], description: 'Please select the environment to which the package needs to be deployed', name: 'depServer'
+  }
+  options {
+        buildDiscarder logRotator(artifactDaysToKeepStr: '', artifactNumToKeepStr: '', daysToKeepStr: '', numToKeepStr: '5')
+  }
+  stages {
+    stage('Set_Environment') {
+      agent {
+        node {
+          label 'Master'
+        }
+      }
+      steps {
+        timestamps() {
+          script{
+		    env.go = 1
+            if("${params.depServer}" == 'IT') {
+              env.user = 'deploy'
+              env.server = 'ABC10054.SOME.DOMAIN.COM'
+              env.sec_grp = 'DEVELOPERS_LDAP_GROUP'
+              env.dep_logs = "/proj/path/to/logs/deployment_logs"
+              env.dep_home = "/proj/deploy"
+            } else if ("${params.depServer}" == 'QA') {
+                env.user = 'deploy'
+                env.server = 'ABC10050.SOME.DOMAIN.COM'
+                env.sec_grp = 'DEVELOPERS_LDAP_GROUP'
+                env.dep_logs = "/proj/path/to/logs/deployment_logs"
+                env.dep_home = "/proj/deploy"
+             } else if ("${params.depServer}" == 'PROD') {
+                 env.user = 'deploy'
+                 env.server = 'ABC020104.SOME.DOMAIN.COM'
+                 env.dep_logs = "/proj/path/to/logs/deployment_logs"
+                 env.dep_home = "/proj/deploy"
+                 env.sec_grp = 'LEADS_LDAP_GROUP'
+		 if git branch --contains "${params.CommitID}" |grep master ; then env.go = 0; echo "${params.CommitID} not in master branch"; fi
+             }
+
+             folder="${WORKSPACE}"
+             env.work_folder = folder.split('/').last()
+    
+          }
+		}
+      }
+    }
+	stage('CodePull-Linux') {
+      agent {
+        node {
+          label 'Master'
+        }
+      }
+	  steps {
+        timestamps() {
+          // Checkout code from github incase commitID from the past is given
+          checkout([$class: 'GitSCM', 
+            branches: [[name: "${params.CommitID}"]], 
+            doGenerateSubmoduleConfigurations: false, 
+            extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'CHECKOUT'],
+              [$class: 'CleanBeforeCheckout', deleteUntrackedNestedRepositories: true]],
+            submoduleCfg: [], 
+            userRemoteConfigs: [[credentialsId: 'deploy', url: "${GIT_URL}"]]]) 
+
+          sh 'if [ -d CHECKOUT/LINUX ]; then rm -r LINUX; mv CHECKOUT/LINUX LINUX; fi'
+          sh 'mkdir temp;' 
+          echo "temp folder created"
+          // Extract all the modified files in commit ID into a temporary file
+          sh "git diff-tree -m --no-commit-id --name-only -r ${params.CommitID} ${params.CommitID}~1 >temp/commitFiles.txt"
+          // Publish files that are being deployed - for verification
+          echo "Verify the files being deployed"
+          echo "Files going to be migrated is as follows:"
+	  echo "ProjectID - ${params.ProjectID}"
+          sh 'cat temp/commitFiles.txt'
+          timeout(5) {
+              input id: 'approval', message: "Deploy the code to ${params.depServer} in FCNA\n\nPlease make sure ProjectID ${params.ProjectID} is approved by IT and Business before Prod deployment", submitter: "${sec_grp}", submitterParameter: 'user' 
+          }
+           
+          // Extract all the Linux files into a tempory file
+          sh 'grep "^LINUX" temp/commitFiles.txt >temp/TrnsfrFiles.txt || true'
+          // Extract all the deployment scripts
+          sh 'find DEPLOYMENT -type f >>temp/TrnsfrFiles.txt'
+          // Extract temp files
+          sh 'find temp -type f >>temp/TrnsfrFiles.txt'
+          // Clear workfolder if existed in the destination server
+          sh "ssh ${user}@${server} 'if [ -d ${dep_home}/${work_folder} ]; then  rm -r ${dep_home}/${work_folder}; fi; mkdir ${dep_home}/${work_folder}'"
+          // Tar all the files and copy it to the destination folder. Extract it and delete the tar file
+          sh "tar -cf ${work_folder}.tar `cat temp/TrnsfrFiles.txt`"
+          sh "scp ${work_folder}.tar ${user}@${server}:${dep_home}/${work_folder}/"
+          sh "ssh ${user}@${server} 'tar -C ${dep_home}/${work_folder} -xf ${dep_home}/${work_folder}/${work_folder}.tar; rm ${dep_home}/${work_folder}/${work_folder}.tar'"
+          //Run Linux deployment script to copy the files in correct path on destnation server
+          sh "ssh ${user}@${server} sh ${dep_home}/${work_folder}/DEPLOYMENT/linux_deploy.sh ${work_folder} ${params.depServer}"
+        }
+      }
+    }
+
+    stage('Deploy_DS_Jobs') {
+      agent {
+        node {
+          label 'DatastageSlave'
+        }
+      }
+      steps {
+        timestamps() {
+          // Checkout code from github incase commitID from the past is given
+          checkout([$class: 'GitSCM', 
+            branches: [[name: "${params.CommitID}"]], 
+            doGenerateSubmoduleConfigurations: false, 
+            extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'CHECKOUT'],
+          [$class: 'CleanBeforeCheckout', deleteUntrackedNestedRepositories: true], 
+          [$class: 'SparseCheckoutPaths', sparseCheckoutPaths: [[path: 'DataStageClient']]]], 
+            submoduleCfg: [], 
+            userRemoteConfigs: [[credentialsId: 'deploy', 
+              url: "${GIT_URL}"]]]) 
+            
+          dir("${WORKSPACE}") {
+        bat 'IF EXIST DataStageClient rm -r DataStageClient'
+	bat 'mv CHECKOUT\\DataStageClient .'
+            bat 'mkdir temp'
+            // Extract all the modified files in commit ID into a temporary file
+            bat "git diff-tree -m --no-commit-id --name-only -r ${params.CommitID} ${params.CommitID}~1 >temp/commitFiles.txt"
+            // Extract all the Datastage files, sort such that jobs (_J) comes before sequences (_S) and copy into a tempory file
+            bat 'grep "^DataStageClient" temp\\commitFiles.txt | rev | sort | rev >temp/DSFiles.txt || true'
+        // Call batch script which takes care of Datastage deployment
+            bat "CALL DEPLOYMENT\\ds_deploy.bat temp\\DSFiles.txt ${params.depServer}"
+          }
+
+
+        }
+
+      }
+    }
+
+  }
+  post {
+  // This section runs irrespective of the job status ofthe above stages
+    always {
+      node('Master') {
+         script{
+       // Extract path inside home directory from JOB_URL. For some reason URL has 'job' but actual path is 'jobs'. Hence replacing that at the end
+           job_path=sh(script: "echo ${JOB_URL} | sed \'s;http.*com\\/\\(.*\\);\\1;\' | sed \'s;job\\/;jobs\\/;g\'", returnStdout: true).trim()
+       build_num="${BUILD_NUMBER}"
+           jenk_home="${HOME}"
+       //Build logpath from the above variables
+       env.log_path=jenk_home+'/'+"${job_path}"+'builds/'+build_num+'/log'            
+     }
+      //sh "curl ${BUILD_URL}+'/consoleText' ${dep_home}/${work_folder}/${work_folder}_${BUILD_NUMBER}.log"
+      //Copying log from master node to Destination server in logfolder path
+      sh "scp ${log_path} ${user}@${server}:${dep_logs}/${work_folder}_${BUILD_NUMBER}.log"
+      //Changing the permissions on file to allow read permission onthe file
+      sh "ssh ${user}@${server} 'chmod 644 ${dep_logs}/${work_folder}_${BUILD_NUMBER}.log'"
+      }
+    }
+  }
+}
